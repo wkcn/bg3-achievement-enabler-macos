@@ -1,107 +1,134 @@
-# 整体思路
+# BG3 Achievement Enabler for macOS
 
-已知信息（Windows 版的源码）→ 目标信息（macOS 版的二进制位置）
+**English** | [简体中文](README.zh-CN.md)
 
-[Windows 版的源码](https://github.com/gottyduke/BG3_AchievementEnabler)告诉我们**"游戏做了什么"，我们需要在 macOS 的二进制中找到"同样逻辑在哪里"**。
+A single-file Python script that patches the macOS build of *Baldur's Gate 3* so that **achievements still unlock when mods are installed**.
 
----
-第 1 步：从 Windows 源码理解逻辑
+The game deliberately disables achievements as soon as it detects a non-standard add-on. On Windows this is solved by runtime mods; on macOS nothing similar existed, so this project ports the same idea as a direct binary patch:
 
-Windows 版 main.cpp 告诉我们：
-- 游戏有一个循环遍历 addon 列表的代码
-- 如果发现有 mod 加载，就跳过成就解锁
-- 补丁方法是把一个条件跳转改成无条件跳转
+- **No dependencies** — runs with the Python 3 pre-installed on macOS.
+- **Minimal change** — rewrites exactly one instruction in each of the two achievement functions.
+- **No hardcoded addresses** — locates the patch sites by instruction pattern, so it keeps working across most game updates.
+- **Safe by default** — backs up the original binary and re-signs it with `codesign`.
 
-关键信息：这是一个关于 "addon 数量" 和 "是否跳过" 的检查逻辑。
+## Credits
 
----
-第 2 步：用字符串定位相关代码区域
+This project would not exist without:
 
-二进制文件中的字符串是最好的"路标"：
+- [gottyduke/BG3_AchievementEnabler](https://github.com/gottyduke/BG3_AchievementEnabler) (MIT) — the Windows achievement enabler. Its source code documents the mod check that suppresses achievements and was the starting point for locating the same logic in the macOS binary. This macOS version applies the same idea, but as a static patch to the ARM64 executable instead of a runtime DLL.
 
-strings "Baldur's Gate 3" | grep -i "achievement"
-strings "Baldur's Gate 3" | grep -i "HasMods"
+## Requirements
 
-找到了：
-- LoadAchievementsDisabled — 成就禁用相关
-- HasMods — mod 检测相关
+- macOS on **Apple Silicon** (the script patches the ARM64 slice of the game binary)
+- *Baldur's Gate 3* (Steam) at the default install path:
 
----
-第 3 步：用符号表找到函数地址
+  ```
+  ~/Library/Application Support/Steam/steamapps/common/Baldurs Gate 3/
+  ```
 
-macOS 的 Mach-O 二进制保留了 C++ 符号名（Windows 版通常被 strip 掉了）：
+- Python 3 (pre-installed on macOS)
+- Xcode Command Line Tools, for the `codesign` tool: `xcode-select --install`
 
-nm bg3_arm64 | grep -i "Achievement"
+## Usage
 
-直接拿到了：
-10480ddbc  __ZN3esv18AchievementManager17UnlockAchievementE...
-10480e1bc  __ZN3esv18AchievementManager26IncreaseAchievementCounterE...
+### Patch
 
-这一步是最关键的捷径 — 有符号名就能直接定位函数。
+1. Make sure the game is **not running**.
+2. Run:
 
----
-第 4 步：反汇编目标函数，理解逻辑
+   ```bash
+   python3 patch_achievements.py
+   ```
 
-对 UnlockAchievement 函数开头反汇编，看到：
+3. Wait for re-signing to finish (30 s – 2 min, depending on disk speed).
+4. Launch the game from Steam as usual — achievements now unlock with mods.
 
-LDR X23, [X22, #0x8B8]    ; 加载全局指针（EocServer 的某个字段）
-LDR W24, [X23, #0x27C]    ; 从中读取一个 32 位整数（addon 数量）
-CBZ W24, +0x50            ; 如果为 0（无 mod），跳过后面的循环
-; --- 下面是循环检查每个 mod 是否是标准模块 ---
+The first run creates `Baldur's Gate 3.backup` next to the game executable. Keep it: it is the pristine original used by `--restore`.
+
+### Restore
+
+```bash
+python3 patch_achievements.py --restore
+```
+
+This copies the backup back over the game executable and re-signs it.
+
+### Notes
+
+- **Re-run the script after every game update.** Updates replace the binary and may move code around.
+- Running Steam's "Verify integrity of game files" also reverts the patch — just run the script again.
+- The script refuses to touch the executable if the pattern is not found, so it will not corrupt an unrecognized game version.
+
+## How it works
+
+### The mod check
+
+Achievements are blocked in two functions of the game's server module:
+
+- `esv::AchievementManager::UnlockAchievement`
+- `esv::AchievementManager::IncreaseAchievementCounter`
+
+Both begin with a loop over the loaded add-on list. The ARM64 disassembly looks like this:
+
+```asm
+LDR  X23, [X22, #0x8B8]    ; load a pointer from the global EocServer
+LDR  W24, [X23, #0x27C]    ; load the 32-bit add-on/mod count
+CBZ  W24, skip_loop        ; count == 0 (no mods) -> skip the check loop
+; --- loop: walk every loaded add-on ---
+BL   IsStandardModule      ; is this one a standard module?
 ...
-BL IsStandardModule        ; 调用检查函数
-...
-; --- 循环结束 ---
-TBZ X28, #0, continue      ; 如果全是标准模块，继续解锁
-MOV W0, #0                 ; 否则返回 false（不解锁）
-B   epilog                 ; 跳到结尾
+; --- end of loop ---
+TBZ  X28, #0, unlock       ; all standard -> keep unlocking
+MOV  W0, #0                ; a mod was found -> return false
+B    epilogue
+```
 
-对比 Windows 版的 x86_64 反汇编（同一个函数）：
-movl  0x27c(%r12), %r13d   ; 同样的偏移 0x27C！
-testq %r13, %r13
-je    skip                  ; 如果为 0 跳过
+If any non-standard add-on is loaded, the function returns early and the achievement is never granted.
 
-两个架构中偏移 0x27C 完全一致，确认了是同一个逻辑。
+### The patch
 
----
-第 5 步：确定补丁策略
+One instruction, four bytes:
 
-原始：CBZ W24, skip    （条件跳转：仅当 mod 数量=0 时跳过循环）
-补丁：B   skip         （无条件跳转：永远跳过循环）
+```asm
+CBZ  W24, skip_loop        ; before: skip the loop only when no mods are loaded
+B    skip_loop             ; after:  always skip the loop
+```
 
-这样无论有没有 mod，代码都跳过检测循环，直接进入正常的成就解锁流程。
+Only the branch condition is dropped; the branch target (the 19-bit immediate) stays the same. With the check loop unconditionally skipped, the normal achievement flow resumes regardless of how many mods are loaded.
 
----
-第 6 步：编写通用搜索 pattern
+### Finding the patch sites without hardcoded addresses
 
-为了让脚本在游戏更新后仍然能工作（函数地址会变），我们不硬编码地址，而是搜索指令模式：
+Game updates move functions around, so the script never stores addresses. Instead it parses the Mach-O file (fat binary header → ARM64 slice → `__TEXT,__text` section) and scans the whole code section for the three-instruction signature of the mod check:
 
-# 三条连续指令的 pattern：
-LDR Xn, [Xm, #0x8B8]   # 加载 EocServer 字段 → mask 0xFFFFFC00, value 0xF9445C00
-LDR Wk, [Xn, #0x27C]   # 加载 mod 计数      → mask 0xFFFFFC00, value 0xB9427C00
-CBZ Wk, <offset>        # 条件跳转           → mask 0xFF000000, value 0x34000000
+| Instruction             | Pattern                    | Constraint        |
+| ----------------------- | -------------------------- | ----------------- |
+| `LDR Xn, [Xm, #0x8B8]`  | value `0xF9445C00`          | mask `0xFFFFFC00` |
+| `LDR Wk, [Xn, #0x27C]`  | value `0xB9427C00`          | Rn == Xn         |
+| `CBZ Wk, <target>`      | opcode `0x34000000`        | Rt == Wk         |
 
-为什么选这三条：
-- 单独的 LDR + CBZ 在 500MB 代码中匹配 60 处（太多误命中）
-- 加上前面的 LDR [#0x8B8] 缩小到 4 处，且前 2 个恰好就是目标函数
+Why exactly these three instructions? A plain `LDR + CBZ` pair matches about 60 places in the ~500 MB binary — far too many. Adding the `LDR ..., [#0x8B8]` anchor narrows it to 4 sites, and the two lowest ones are precisely the two `AchievementManager` functions. The script patches those two and ignores the rest.
 
----
-总结：逆向分析的一般方法论
+### How the pattern was found
 
-┌─────────────┬────────────────────────┬───────────────────────┐
-│    步骤     │          方法          │         工具          │
-├─────────────┼────────────────────────┼───────────────────────┤
-│ 1. 理解功能 │ 阅读已有源码/文档      │ 源码、mod 社区        │
-├─────────────┼────────────────────────┼───────────────────────┤
-│ 2. 找"锚点" │ 搜索字符串常量         │ strings, grep         │
-├─────────────┼────────────────────────┼───────────────────────┤
-│ 3. 定位函数 │ 查符号表               │ nm, objdump           │
-├─────────────┼────────────────────────┼───────────────────────┤
-│ 4. 理解逻辑 │ 反汇编 + 阅读          │ otool -d, Python 解码 │
-├─────────────┼────────────────────────┼───────────────────────┤
-│ 5. 设计补丁 │ 最小修改原则           │ 改一条指令即可        │
-├─────────────┼────────────────────────┼───────────────────────┤
-│ 6. 模式搜索 │ 用指令特征而非固定地址 │ Python struct         │
-└─────────────┴────────────────────────┴───────────────────────┘
+Condensed reverse-engineering notes:
 
-核心原则：利用已知信息缩小范围。从 500MB 的二进制 → 字符串锁定区域 → 符号名锁定函数 → 反汇编理解逻辑 → 一条指令搞定。
+1. **Understand the logic from the Windows source.** gottyduke's enabler shows what to look for: a loop over the add-on list that suppresses achievements when a mod is present.
+2. **Strings as landmarks.** `strings "Baldur's Gate 3" | grep -i achievement` surfaces `LoadAchievementsDisabled` and `HasMods` — the mod detection is nearby.
+3. **Symbol table.** Unlike the stripped Windows binary, the macOS Mach-O keeps its C++ symbols, so `nm` directly yields the addresses of both `AchievementManager` functions — the biggest shortcut in the whole process.
+4. **Disassemble and cross-check.** `otool` shows the `LDR [#0x8B8] / LDR [#0x27C] / CBZ` sequence at the top of each function. The Windows x86 build reads the very same field (`movl 0x27c(%r12), %r13d`) — the `0x27C` offset is identical on both architectures, confirming it is the same logic.
+5. **Minimal patch.** Flip `CBZ` into `B` and keep the branch target — done.
+
+## FAQ
+
+**Is it safe?**
+The patch changes one instruction in each of two functions, keeps a full backup, and validates the original bytes before writing anything. `--restore` brings back the pristine binary at any time.
+
+**Does it affect Steam's achievement reporting?**
+No. It only removes the local mod check; achievements still unlock through the game's normal code path, and Steam/GOG record them as usual.
+
+**Intel Macs?**
+Not supported — the script only patches the ARM64 slice of the game binary.
+
+## License
+
+[MIT](LICENSE), same as the reference project.

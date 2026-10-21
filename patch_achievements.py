@@ -1,57 +1,55 @@
 #!/usr/bin/env python3
 """
-BG3 Achievement Enabler for macOS (ARM64)
+BG3 Achievement Enabler for macOS (Apple Silicon)
 
-功能：修补博德之门3可执行文件，使得使用 mod 时仍能解锁 Steam/GOG 成就。
+Patches the macOS build of Baldur's Gate 3 so that achievements still
+unlock when mods are installed.
 
-原理：
-  游戏在 esv::AchievementManager::UnlockAchievement 和
-  esv::AchievementManager::IncreaseAchievementCounter 两个函数开头，
-  有一段循环检查是否加载了 addon/mod。如果检测到 mod，则不解锁成就。
+The game suppresses achievements as soon as it detects a non-standard
+add-on. Both esv::AchievementManager::UnlockAchievement and
+esv::AchievementManager::IncreaseAchievementCounter begin with a loop
+that walks the loaded add-on list. This tool rewrites the branch that
+guards that loop from a conditional CBZ ("skip the loop only when no
+mods are loaded") into an unconditional B ("always skip the loop"),
+restoring the normal achievement flow for modded games.
 
-  本工具将检查逻辑中的 CBZ（条件跳转：当 mod 数量为 0 时跳过）
-  改为 B（无条件跳转：永远跳过 mod 检查循环），从而绕过限制。
+Usage:
+    python3 patch_achievements.py             # patch the game binary
+    python3 patch_achievements.py --restore   # restore the original binary
 
-使用方法：
-  1. 确保游戏未在运行
-  2. 运行本脚本：python3 patch_achievements.py
-  3. 等待 codesign 重签名完成（约30秒-2分钟，取决于磁盘速度）
-  4. 从 Steam 正常启动游戏
-
-恢复方法：
-  python3 patch_achievements.py --restore
-
-注意：
-  - 游戏更新后需要重新运行本脚本
-  - 脚本会自动备份原始文件为 "Baldur's Gate 3.backup"
-  - 需要 macOS 自带的 codesign 工具（Xcode Command Line Tools）
+Notes:
+    * Make sure the game is not running before patching.
+    * The patch must be re-applied after every game update.
+    * The original binary is backed up as "Baldur's Gate 3.backup".
+    * Requires macOS's built-in codesign tool (Xcode Command Line Tools).
 """
 
-import struct
+import argparse
 import shutil
+import struct
 import subprocess
 import sys
-import os
 from pathlib import Path
 
 # ============================================================
-# 配置
+# Configuration
 # ============================================================
 
 GAME_DIR = Path.home() / "Library/Application Support/Steam/steamapps/common/Baldurs Gate 3/Baldur's Gate 3.app/Contents/MacOS"
 GAME_EXE = GAME_DIR / "Baldur's Gate 3"
 BACKUP_EXE = GAME_DIR / "Baldur's Gate 3.backup"
 
+
 # ============================================================
-# 补丁定义
+# Mach-O parsing
 # ============================================================
 
 def find_arm64_offset(game_path: Path) -> int:
-    """解析 fat binary，找到 ARM64 slice 的文件偏移"""
+    """Parse the fat binary header and return the file offset of the ARM64 slice."""
     with open(game_path, 'rb') as f:
         magic = struct.unpack('>I', f.read(4))[0]
         if magic != 0xCAFEBABE:
-            raise ValueError(f"不是 fat binary (magic: 0x{magic:08x})")
+            raise ValueError(f"Not a fat binary (magic: 0x{magic:08x})")
 
         nfat = struct.unpack('>I', f.read(4))[0]
         for _ in range(nfat):
@@ -63,15 +61,15 @@ def find_arm64_offset(game_path: Path) -> int:
             if cputype == 0x0100000C:  # CPU_TYPE_ARM64
                 return offset
 
-    raise ValueError("未找到 ARM64 slice")
+    raise ValueError("ARM64 slice not found")
 
 
 def find_text_section(game_path: Path, arm64_base: int) -> tuple:
-    """解析 Mach-O 获取 __TEXT,__text section 的文件偏移和大小"""
+    """Parse the ARM64 Mach-O and return (file offset, size) of the __TEXT,__text section."""
     with open(game_path, 'rb') as f:
         f.seek(arm64_base)
         magic = struct.unpack('<I', f.read(4))[0]
-        assert magic == 0xFEEDFACF, f"ARM64 slice magic 不正确: 0x{magic:08x}"
+        assert magic == 0xFEEDFACF, f"Unexpected ARM64 slice magic: 0x{magic:08x}"
 
         f.seek(arm64_base + 16)
         ncmds = struct.unpack('<I', f.read(4))[0]
@@ -95,31 +93,37 @@ def find_text_section(game_path: Path, arm64_base: int) -> tuple:
                         f.seek(sect_offset)
                         sectname_raw = f.read(16)
                         sectname = sectname_raw.split(b'\x00')[0].decode('ascii', errors='ignore')
-                        _ = f.read(16)  # segname
+                        _ = f.read(16)                          # segname
                         _ = struct.unpack('<Q', f.read(8))[0]  # addr
-                        sect_size = struct.unpack('<Q', f.read(8))[0]  # size
-                        sect_fileoff = struct.unpack('<I', f.read(4))[0]  # offset
+                        sect_size = struct.unpack('<Q', f.read(8))[0]
+                        sect_fileoff = struct.unpack('<I', f.read(4))[0]
 
                         if sectname == '__text':
                             return (arm64_base + sect_fileoff, sect_size)
                     break
             cmd_offset += cmdsize
 
-    raise ValueError("未找到 __TEXT,__text section")
+    raise ValueError("__TEXT,__text section not found")
 
+
+# ============================================================
+# Patch discovery
+# ============================================================
 
 def find_patch_locations(game_path: Path, arm64_base: int) -> list:
     """
-    在 ARM64 代码段中搜索 AchievementManager 的 mod 检测模式。
+    Scan the ARM64 code for the mod-detection pattern used by the
+    AchievementManager functions.
 
-    精确模式（3条连续指令）：
-      LDR Xn, [Xm, #0x8B8]   ; 从全局 EocServer 加载指针
-      LDR Wk, [Xn, #0x27C]   ; 加载 addon/mod 数量
-      CBZ Wk, <skip>          ; 如果为0（无mod）则跳过循环
+    Exact pattern (three consecutive instructions):
+        LDR Xn, [Xm, #0x8B8]   ; load a pointer from the global EocServer
+        LDR Wk, [Xn, #0x27C]   ; load the add-on/mod count
+        CBZ Wk, <skip>         ; if zero (no mods), skip the check loop
 
-    将 CBZ 改为 B（无条件跳转），使得无论有无 mod 都跳过检查循环。
+    The patch rewrites CBZ into B (unconditional branch), so the check
+    loop is always skipped, with or without mods.
 
-    返回 [(file_offset, original_insn, patched_insn), ...]
+    Returns a list of (file_offset, original_insn, patched_insn) tuples.
     """
     text_file_offset, text_size = find_text_section(game_path, arm64_base)
 
@@ -136,83 +140,87 @@ def find_patch_locations(game_path: Path, arm64_base: int) -> list:
         insn2 = struct.unpack_from('<I', code, (i + 2) * 4)[0]
 
         # insn0: LDR Xn, [Xm, #0x8B8]
-        # 编码: 0xF9400000 | (imm12 << 10) | (Rn << 5) | Rt
-        # imm12 = 0x8B8 / 8 = 0x117
-        # mask 0xFFFFFC00 匹配 opcode + imm12，允许 Rn/Rt 变化
+        # Encoding: 0xF9400000 | (imm12 << 10) | (Rn << 5) | Rt
+        # with imm12 = 0x8B8 / 8 = 0x117. The mask keeps the opcode and
+        # the immediate fixed while allowing any Rn/Rt registers.
         if (insn0 & 0xFFFFFC00) != 0xF9445C00:
             continue
-        rt0 = insn0 & 0x1F  # Xn（存放模组列表指针）
+        rt0 = insn0 & 0x1F  # Xn (holds the add-on list pointer)
 
-        # insn1: LDR Wk, [Xn, #0x27C]  (Xn = rt0)
-        # imm12 = 0x27C / 4 = 0x9F
+        # insn1: LDR Wk, [Xn, #0x27C], with Xn == rt0
+        # Encoding: 0xB9400000 | (imm12 << 10) | (Rn << 5) | Rt
+        # with imm12 = 0x27C / 4 = 0x9F
         if (insn1 & 0xFFFFFC00) != 0xB9427C00:
             continue
         rn1 = (insn1 >> 5) & 0x1F
         if rn1 != rt0:
             continue
-        rt1 = insn1 & 0x1F  # Wk（mod 数量）
+        rt1 = insn1 & 0x1F  # Wk (the mod count)
 
         # insn2: CBZ Wk, +offset
         if (insn2 & 0xFF00001F) != (0x34000000 | rt1):
             continue
 
-        # 匹配成功！计算补丁
+        # Match found: keep the branch target, drop the condition.
         file_offset = text_file_offset + (i + 2) * 4
         imm19 = (insn2 >> 5) & 0x7FFFF
-        b_insn = 0x14000000 | imm19  # B（无条件跳转），偏移不变
+        b_insn = 0x14000000 | imm19  # B (unconditional branch), same target
         patches.append((file_offset, insn2, b_insn))
 
     return patches
 
 
 def remove_log_files():
-    """删除 MacOS 目录下的 log 文件，否则 codesign 会报错"""
+    """Delete stray log files in the MacOS directory; codesign rejects them."""
     for f in GAME_DIR.glob("*.log"):
         f.unlink()
-        print(f"  删除: {f.name}")
+        print(f"  deleted: {f.name}")
 
 
 # ============================================================
-# 主流程
+# Main flow
 # ============================================================
 
 def do_patch():
-    """执行补丁"""
+    """Apply the patch."""
     print("=" * 60)
     print("BG3 Achievement Enabler for macOS")
     print("=" * 60)
     print()
 
     if not GAME_EXE.exists():
-        print(f"错误: 游戏文件不存在\n  {GAME_EXE}")
+        print(f"Error: game executable not found\n  {GAME_EXE}")
         sys.exit(1)
 
-    # Step 1: 备份
+    # Step 1: back up the original binary
     if not BACKUP_EXE.exists():
-        print("[1/4] 备份原始文件...")
+        print("[1/4] Backing up the original file...")
         shutil.copy2(GAME_EXE, BACKUP_EXE)
-        print(f"  备份到: {BACKUP_EXE}")
+        print(f"  backup: {BACKUP_EXE}")
     else:
-        print("[1/4] 备份已存在，跳过")
+        print("[1/4] Backup already exists, skipping")
     print()
 
-    # Step 2: 查找补丁位置
-    print("[2/4] 分析可执行文件...")
+    # Step 2: locate the patch sites
+    print("[2/4] Analyzing the executable...")
     arm64_base = find_arm64_offset(GAME_EXE)
-    print(f"  ARM64 slice 偏移: 0x{arm64_base:x}")
+    print(f"  ARM64 slice offset: 0x{arm64_base:x}")
 
     patches = find_patch_locations(GAME_EXE, arm64_base)
-    print(f"  找到 {len(patches)} 个补丁位置")
+    print(f"  found {len(patches)} candidate patch sites")
 
     if len(patches) < 2:
-        print("  警告: 预期至少找到 2 个位置 (UnlockAchievement + IncreaseAchievementCounter)")
+        print("  warning: expected at least 2 sites (UnlockAchievement + IncreaseAchievementCounter)")
         if len(patches) == 0:
-            print("  错误: 未找到补丁位置，可能游戏版本不兼容")
+            print("  error: no patch site found; this game version is likely incompatible")
             sys.exit(1)
     print()
 
-    # Step 3: 应用补丁
-    print("[3/4] 应用补丁...")
+    # Step 3: apply the patch
+    # The three-instruction pattern matches a handful of sites; the first
+    # two are exactly the two AchievementManager functions, the rest are
+    # unrelated false positives.
+    print("[3/4] Applying patches...")
     with open(GAME_EXE, 'r+b') as f:
         for i, (offset, original, replacement) in enumerate(patches[:2]):
             f.seek(offset)
@@ -221,17 +229,17 @@ def do_patch():
                 f.seek(offset)
                 f.write(struct.pack('<I', replacement))
                 func_name = "UnlockAchievement" if i == 0 else "IncreaseAchievementCounter"
-                print(f"  ✓ Patch {i+1} ({func_name}):")
-                print(f"    偏移: 0x{offset:x}")
+                print(f"  ✓ Patch {i + 1} ({func_name}):")
+                print(f"    offset: 0x{offset:x}")
                 print(f"    CBZ 0x{original:08x} -> B 0x{replacement:08x}")
             elif val == replacement:
-                print(f"  → Patch {i+1}: 已经是修补状态")
+                print(f"  → Patch {i + 1}: already patched")
             else:
-                print(f"  ✗ Patch {i+1}: 值不匹配 (0x{val:08x})，跳过")
+                print(f"  ✗ Patch {i + 1}: unexpected value (0x{val:08x}), skipped")
     print()
 
-    # Step 4: 重新签名
-    print("[4/4] 重新签名 (可能需要30秒-2分钟)...")
+    # Step 4: re-sign the patched binary
+    print("[4/4] Re-signing with codesign (this may take 30s-2min)...")
     remove_log_files()
 
     result = subprocess.run(
@@ -240,54 +248,63 @@ def do_patch():
     )
 
     if result.returncode == 0:
-        print("  ✓ 签名完成")
+        print("  ✓ signed")
     else:
-        print(f"  ✗ 签名失败: {result.stderr}")
-        print("  尝试手动运行: codesign --force --sign - \"" + str(GAME_EXE) + "\"")
+        print(f"  ✗ signing failed: {result.stderr}")
+        print('  try manually: codesign --force --sign - "' + str(GAME_EXE) + '"')
         sys.exit(1)
 
-    # 验证
     result = subprocess.run(
         ["codesign", "-v", str(GAME_EXE)],
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print("  ✓ 签名验证通过")
+        print("  ✓ signature verified")
     else:
-        print(f"  ⚠ 签名验证: {result.stderr.strip()}")
+        print(f"  ⚠ verification: {result.stderr.strip()}")
 
     print()
     print("=" * 60)
-    print("完成！现在可以从 Steam 正常启动游戏，mod 成就已解锁。")
+    print("Done! Launch the game from Steam - achievements now unlock with mods.")
     print("=" * 60)
 
 
 def do_restore():
-    """恢复原始文件"""
-    print("恢复原始文件...")
+    """Restore the original binary from the backup."""
+    print("Restoring the original file...")
 
     if not BACKUP_EXE.exists():
-        print(f"错误: 备份文件不存在: {BACKUP_EXE}")
+        print(f"Error: backup file not found: {BACKUP_EXE}")
         sys.exit(1)
 
     shutil.copy2(BACKUP_EXE, GAME_EXE)
-    print(f"  ✓ 已恢复: {GAME_EXE}")
+    print(f"  ✓ restored: {GAME_EXE}")
 
-    # 重新签名
-    print("  重新签名...")
+    print("  re-signing...")
     remove_log_files()
     subprocess.run(["codesign", "--force", "--sign", "-", str(GAME_EXE)], check=True)
-    print("  ✓ 完成")
+    print("  ✓ done")
 
 
 # ============================================================
-# 入口
+# Entry point
 # ============================================================
 
-if __name__ == "__main__":
-    if "--restore" in sys.argv:
+def main():
+    parser = argparse.ArgumentParser(
+        description="Patch Baldur's Gate 3 (macOS) so achievements unlock with mods installed."
+    )
+    parser.add_argument(
+        "--restore", action="store_true",
+        help="restore the original executable from the backup"
+    )
+    args = parser.parse_args()
+
+    if args.restore:
         do_restore()
-    elif "--help" in sys.argv or "-h" in sys.argv:
-        print(__doc__)
     else:
         do_patch()
+
+
+if __name__ == "__main__":
+    main()
