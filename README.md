@@ -8,7 +8,7 @@ The game deliberately disables achievements as soon as it detects a non-standard
 
 - **No dependencies** — runs with the Python 3 pre-installed on macOS.
 - **Minimal change** — rewrites exactly one instruction in each of the two achievement functions.
-- **No hardcoded addresses** — locates the patch sites by instruction pattern, so it keeps working across most game updates.
+- **Update-resilient** — locates the two functions via the binary's symbol table and matches the mod check with wildcard struct offsets, so it keeps working when game updates move code around or shift offsets.
 - **Safe by default** — backs up the original binary and re-signs it with `codesign`.
 
 ## Credits
@@ -68,10 +68,10 @@ Achievements are blocked in two functions of the game's server module:
 - `esv::AchievementManager::UnlockAchievement`
 - `esv::AchievementManager::IncreaseAchievementCounter`
 
-Both begin with a loop over the loaded add-on list. The ARM64 disassembly looks like this:
+Both begin with a loop over the loaded add-on list. The ARM64 disassembly looks like this (load offsets vary between game versions; the ones below are from a recent build):
 
 ```asm
-LDR  X23, [X22, #0x8B8]    ; load a pointer from the global EocServer
+LDR  X23, [X22, #0xF58]    ; load the add-on manager from a global
 LDR  W24, [X23, #0x27C]    ; load the 32-bit add-on/mod count
 CBZ  W24, skip_loop        ; count == 0 (no mods) -> skip the check loop
 ; --- loop: walk every loaded add-on ---
@@ -98,15 +98,14 @@ Only the branch condition is dropped; the branch target (the 19-bit immediate) s
 
 ### Finding the patch sites without hardcoded addresses
 
-Game updates move functions around, so the script never stores addresses. Instead it parses the Mach-O file (fat binary header → ARM64 slice → `__TEXT,__text` section) and scans the whole code section for the three-instruction signature of the mod check:
+Game updates move functions around *and* shift struct offsets — a hotfix once moved the global load from `#0x8B8` to `#0xF58`, which broke the first version of this script. The locator therefore relies on nothing that is update-fragile:
 
-| Instruction             | Pattern                    | Constraint        |
-| ----------------------- | -------------------------- | ----------------- |
-| `LDR Xn, [Xm, #0x8B8]`  | value `0xF9445C00`          | mask `0xFFFFFC00` |
-| `LDR Wk, [Xn, #0x27C]`  | value `0xB9427C00`          | Rn == Xn         |
-| `CBZ Wk, <target>`      | opcode `0x34000000`        | Rt == Wk         |
+1. **Symbol table.** Unlike the stripped Windows binary, the macOS Mach-O keeps its C++ symbols. The script parses `LC_SYMTAB` itself and looks up `esv::AchievementManager::UnlockAchievement` / `IncreaseAchievementCounter` by mangled name, which also bounds each function body.
+2. **Wildcard pattern inside each function.** The mod check is matched as a register-linked triple — `LDR Xn, [Xm, #imm]` → `LDR Wk, [Xn, #imm2]` → `CBZ Wk` — with both load offsets as wildcards.
+3. **Loop signature.** The match is confirmed by the add-on walk that follows: a `BL` to the name-comparison helper, a `TBZ W0` on its result, a pointer bump of `0x60` (the add-on array stride) and a backward `B.NE`. Exactly one such site exists inside each function.
+4. **Fallback for stripped binaries.** If the symbols are ever missing, the whole `__TEXT,__text` section is scanned for the same pattern, and the unique *pair* of sites that share the same load offsets, call the same helper and sit within 4 KB of each other is accepted — the two functions are emitted back-to-back and walk the same add-on list.
 
-Why exactly these three instructions? A plain `LDR + CBZ` pair matches about 60 places in the ~500 MB binary — far too many. Adding the `LDR ..., [#0x8B8]` anchor narrows it to 4 sites, and the two lowest ones are precisely the two `AchievementManager` functions. The script patches those two and ignores the rest.
+An already-patched branch (the unconditional `B` this script writes) is recognized as well, so re-running the script is a safe no-op instead of an error.
 
 ### How the pattern was found
 
